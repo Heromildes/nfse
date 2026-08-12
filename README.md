@@ -1,6 +1,6 @@
 # Receptor ZIP NFS-e (servidor local)
 
-API Python simples no **servidor de arquivos**. O hub (Rails no Hatchbox) envia o ZIP via HTTP; este serviço grava o arquivo na pasta de controle.
+API Python simples no **servidor de arquivos**. O hub (Rails no Hatchbox) envia o ZIP via HTTP; este serviço descompacta o conteúdo na pasta de controle (sem deixar o `.zip`).
 
 Substitui o download no navegador quando o usuário clica **Baixar ZIP** em `/gerar-nfse`.
 
@@ -9,7 +9,7 @@ Substitui o download no navegador quando o usuário clica **Baixar ZIP** em `/ge
 1. Usuário clica **Baixar ZIP** no hub → export gerado até `ready`.
 2. Frontend chama `POST /api/v1/nfse_zip_exports/:id/deliver_local`.
 3. Rails envia o ZIP (multipart) para esta API (`POST /v1/nfse-zips`).
-4. Arquivo é gravado em `NFSE_DEST_DIR` e o export fica `delivered`.
+4. Conteúdo do ZIP é extraído em `NFSE_DEST_DIR/<nome-do-zip>/` (sem gravar o `.zip`) e o export fica `delivered`.
 
 O robô pull (`tools/nfse-zip-robot`) **não muda**. Com `delivered`, ele não reprocessa o mesmo export.
 
@@ -87,7 +87,7 @@ NFSE_LOCAL_RECEIVER_ORIGIN=https://hub.silveirasoares.com.br
 
 - API key Bearer obrigatória (comparação constante).
 - Allowlist de Origin/Referer (hub + hatchbox).
-- Só `.zip`; nome sanitizado (sem path traversal); não sobrescreve arquivos existentes.
+- Só `.zip`; nome sanitizado; extração com proteção contra zip slip; não sobrescreve pastas existentes.
 - Limite de tamanho; docs Swagger desabilitados.
 - UI de config no hub restrita ao e-mail gerenciador.
 

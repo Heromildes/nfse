@@ -54,8 +54,8 @@ def test_health(client: TestClient) -> None:
     assert response.json() == {"ok": True}
 
 
-def test_upload_saves_zip(client: TestClient, dest_dir: Path) -> None:
-    data = _zip_bytes()
+def test_upload_extracts_zip(client: TestClient, dest_dir: Path) -> None:
+    data = _zip_bytes("nota.xml", b"<xml/>")
     response = client.post(
         "/v1/nfse-zips",
         headers=_auth_headers(),
@@ -63,11 +63,13 @@ def test_upload_saves_zip(client: TestClient, dest_dir: Path) -> None:
     )
     assert response.status_code == 201
     body = response.json()
-    assert body["savedAs"] == "cliente.zip"
-    saved = dest_dir / "cliente.zip"
-    assert saved.is_file()
-    assert saved.read_bytes() == data
-    assert Path(body["path"]) == saved
+    assert body["extractedTo"] == "cliente"
+    assert body["files"] == 1
+    extracted = dest_dir / "cliente"
+    assert extracted.is_dir()
+    assert (extracted / "nota.xml").read_bytes() == b"<xml/>"
+    assert not (dest_dir / "cliente.zip").exists()
+    assert Path(body["path"]) == extracted
 
 
 def test_upload_rejects_missing_api_key(client: TestClient) -> None:
@@ -107,7 +109,7 @@ def test_upload_accepts_referer_when_origin_missing(client: TestClient, dest_dir
         files={"file": ("via-referer.zip", _zip_bytes(), "application/zip")},
     )
     assert response.status_code == 201
-    assert (dest_dir / "via-referer.zip").is_file()
+    assert (dest_dir / "via-referer").is_dir()
 
 
 def test_upload_rejects_non_zip_extension(client: TestClient) -> None:
@@ -126,12 +128,12 @@ def test_upload_sanitizes_path_traversal(client: TestClient, dest_dir: Path) -> 
         files={"file": ("../../etc/passwd.zip", _zip_bytes(), "application/zip")},
     )
     assert response.status_code == 201
-    assert response.json()["savedAs"] == "passwd.zip"
-    assert (dest_dir / "passwd.zip").is_file()
+    assert response.json()["extractedTo"] == "passwd"
+    assert (dest_dir / "passwd").is_dir()
     assert not (dest_dir / "etc").exists()
 
 
-def test_upload_does_not_overwrite(client: TestClient, dest_dir: Path) -> None:
+def test_upload_does_not_overwrite_extract_dir(client: TestClient, dest_dir: Path) -> None:
     first = _zip_bytes(content=b"one")
     second = _zip_bytes(content=b"two")
     client.post(
@@ -145,9 +147,9 @@ def test_upload_does_not_overwrite(client: TestClient, dest_dir: Path) -> None:
         files={"file": ("mesmo.zip", second, "application/zip")},
     )
     assert response.status_code == 201
-    assert response.json()["savedAs"] == "mesmo_1.zip"
-    assert (dest_dir / "mesmo.zip").read_bytes() == first
-    assert (dest_dir / "mesmo_1.zip").read_bytes() == second
+    assert response.json()["extractedTo"] == "mesmo_1"
+    assert (dest_dir / "mesmo" / "nota.xml").read_bytes() == b"one"
+    assert (dest_dir / "mesmo_1" / "nota.xml").read_bytes() == b"two"
 
 
 def test_upload_rejects_oversize(client: TestClient) -> None:
@@ -159,3 +161,25 @@ def test_upload_rejects_oversize(client: TestClient) -> None:
         files={"file": ("grande.zip", big, "application/zip")},
     )
     assert response.status_code == 413
+
+
+def test_upload_rejects_invalid_zip(client: TestClient) -> None:
+    response = client.post(
+        "/v1/nfse-zips",
+        headers=_auth_headers(),
+        files={"file": ("ruim.zip", b"not-a-zip", "application/zip")},
+    )
+    assert response.status_code == 400
+
+
+def test_upload_rejects_zip_slip(client: TestClient, dest_dir: Path) -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("../evil.txt", b"x")
+    response = client.post(
+        "/v1/nfse-zips",
+        headers=_auth_headers(),
+        files={"file": ("slip.zip", buf.getvalue(), "application/zip")},
+    )
+    assert response.status_code == 400
+    assert not (dest_dir / "evil.txt").exists()

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""API local — recebe ZIP NFS-e do hub e grava na pasta de controle."""
+"""API local — recebe ZIP NFS-e do hub e extrai na pasta de controle."""
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
 import secrets
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -107,6 +109,41 @@ def unique_path(directory: Path, filename: str) -> Path:
         index += 1
 
 
+def unique_dir(directory: Path, name: str) -> Path:
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    index = 1
+    while True:
+        candidate = directory / f"{name}_{index}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def safe_extract(zf: zipfile.ZipFile, dest: Path) -> int:
+    """Extract zip members into dest; reject path traversal. Returns file count."""
+    dest = dest.resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    files = 0
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        if not name or name.endswith("/"):
+            continue
+        # Drop absolute / drive-style prefixes before joining
+        parts = [p for p in Path(name).parts if p not in ("/", ".", "..")]
+        if not parts or ".." in Path(name).parts:
+            raise HTTPException(status_code=400, detail="ZIP com caminho inválido.")
+        target = (dest / Path(*parts)).resolve()
+        if not target.is_relative_to(dest):
+            raise HTTPException(status_code=400, detail="ZIP com caminho inválido.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, target.open("wb") as out:
+            out.write(src.read())
+        files += 1
+    return files
+
+
 def origin_from_headers(origin: str | None, referer: str | None) -> str | None:
     if origin and origin.strip():
         return origin.strip().rstrip("/")
@@ -167,13 +204,31 @@ async def receive_zip(
         raise HTTPException(status_code=400, detail="Arquivo vazio.")
 
     cfg.dest_dir.mkdir(parents=True, exist_ok=True)
-    target = unique_path(cfg.dest_dir, filename)
-    target.write_bytes(data)
+    extract_dir = unique_dir(cfg.dest_dir, Path(filename).stem)
 
-    logger.info("ZIP salvo: %s (%s bytes)", target.name, len(data))
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            if zf.testzip() is not None:
+                raise HTTPException(status_code=400, detail="ZIP corrompido.")
+            file_count = safe_extract(zf, extract_dir)
+    except HTTPException:
+        raise
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="ZIP inválido.") from None
+
+    logger.info(
+        "ZIP extraído: %s (%s bytes, %s arquivos)",
+        extract_dir.name,
+        len(data),
+        file_count,
+    )
     return JSONResponse(
         status_code=201,
-        content={"savedAs": target.name, "path": str(target)},
+        content={
+            "extractedTo": extract_dir.name,
+            "path": str(extract_dir),
+            "files": file_count,
+        },
     )
 
 
