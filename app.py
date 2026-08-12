@@ -27,6 +27,23 @@ DEFAULT_ORIGINS = (
 )
 UNSAFE_NAME = re.compile(r"[^\w.\- ]+", re.UNICODE)
 
+# macOS/browsers e o hub podem usar / ou _ no CNPJ do nome do arquivo
+CNPJ_IN_FILENAME = r"\d{2}\.\d{3}\.\d{3}[/_]\d{4}-\d{2}"
+CNPJ_PATTERN = re.compile(CNPJ_IN_FILENAME)
+MONTH_FOLDER_PATTERN = re.compile(r"^\d{4}-\d{2}$")
+ZIP_WITH_PERIOD = re.compile(
+    rf"^(?P<codigo>.+?) - (?P<razao>.+) - (?P<cnpj>{CNPJ_IN_FILENAME}) - (?P<periodo>.+)\.zip$",
+    re.IGNORECASE,
+)
+ZIP_LEGACY = re.compile(
+    rf"^(?P<codigo>.+?) - (?P<razao>.+) - (?P<cnpj>{CNPJ_IN_FILENAME})\.zip$",
+    re.IGNORECASE,
+)
+MAC_DUPLICATE_SUFFIX = re.compile(r"(_\d{8}_\d{6})+$")
+BROWSER_COPY_SUFFIX = re.compile(r"\s*\(\d+\)\s*$")
+PERIOD_MONTH_YEAR = re.compile(r"^\d{2}-\d{4}$")
+PERIOD_RANGE = re.compile(r"^\d{2}-\d{2}-\d{4} a \d{2}-\d{2}-\d{4}$")
+
 logger = logging.getLogger("nfse_zip_receiver")
 
 
@@ -36,6 +53,18 @@ class Settings:
     dest_dir: Path
     allowed_origins: frozenset[str]
     max_upload_bytes: int
+
+
+@dataclass(frozen=True)
+class NfseZipMeta:
+    codigo: str
+    razao: str
+    cnpj: str
+    periodo: str
+
+    @property
+    def client_folder(self) -> str:
+        return f"{self.codigo} - {self.razao} - {self.cnpj}"
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -87,26 +116,101 @@ def setup_logging() -> None:
 
 
 def sanitize_filename(raw: str | None) -> str:
-    name = Path(raw or "nfse.zip").name
-    name = name.replace("\\", "/").split("/")[-1]
+    # Substitui separadores antes de Path.name — senão "…678/0001-23 - 07-2026.zip" vira só o sufixo
+    name = (raw or "nfse.zip").replace("\\", "_").replace("/", "_")
+    name = Path(name).name
     name = UNSAFE_NAME.sub("_", name).strip(" ._") or "nfse.zip"
     if not name.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Apenas arquivos .zip são aceitos.")
     return name
 
 
-def unique_path(directory: Path, filename: str) -> Path:
-    candidate = directory / filename
-    if not candidate.exists():
-        return candidate
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
-    index = 1
-    while True:
-        candidate = directory / f"{stem}_{index}{suffix}"
-        if not candidate.exists():
-            return candidate
-        index += 1
+def normalize_cnpj_folder(cnpj: str) -> str:
+    # `_` no disco — `/` vira path separator no Windows/macOS
+    return re.sub(r"(\d{2}\.\d{3}\.\d{3})[/_](\d{4}-\d{2})", r"\1_\2", cnpj.strip())
+
+
+def normalize_periodo(raw: str) -> str:
+    periodo = raw.strip().removesuffix(".zip").strip()
+    periodo = BROWSER_COPY_SUFFIX.sub("", periodo).strip()
+    periodo = MAC_DUPLICATE_SUFFIX.sub("", periodo).strip()
+
+    if PERIOD_MONTH_YEAR.match(periodo) or PERIOD_RANGE.match(periodo):
+        return periodo
+    if periodo.lower() == "incremental":
+        return "Incremental"
+
+    month_year = re.match(r"^(\d{2}-\d{4})", periodo)
+    if month_year:
+        return month_year.group(1)
+
+    if " a " in periodo:
+        range_part = periodo.split("_")[0].strip()
+        if PERIOD_RANGE.match(range_part):
+            return range_part
+
+    if "_" in periodo:
+        head = periodo.split("_")[0].strip()
+        if PERIOD_MONTH_YEAR.match(head):
+            return head
+
+    return "Incremental"
+
+
+def parse_zip_filename(name: str) -> NfseZipMeta | None:
+    # Normaliza / do CNPJ antes do basename — senão Path corta em 0001-XX
+    stem = re.sub(
+        r"(\d{2}\.\d{3}\.\d{3})/(\d{4}-\d{2})",
+        r"\1_\2",
+        (name or "").strip(),
+    )
+    stem = stem.replace("\\", "/")
+    if "/" in stem:
+        stem = stem.split("/")[-1]
+    if not stem.lower().endswith(".zip"):
+        return None
+
+    match = ZIP_WITH_PERIOD.match(stem)
+    if match:
+        return NfseZipMeta(
+            codigo=match.group("codigo").strip(),
+            razao=match.group("razao").strip(),
+            cnpj=normalize_cnpj_folder(match.group("cnpj")),
+            periodo=normalize_periodo(match.group("periodo")),
+        )
+
+    match = ZIP_LEGACY.match(stem)
+    if match:
+        return NfseZipMeta(
+            codigo=match.group("codigo").strip(),
+            razao=match.group("razao").strip(),
+            cnpj=normalize_cnpj_folder(match.group("cnpj")),
+            periodo="Incremental",
+        )
+
+    # Após sanitize o CNPJ já vem com `_`; ainda assim cobre upload cru com `/`
+    cnpj_match = CNPJ_PATTERN.search(stem)
+    if not cnpj_match:
+        return None
+
+    cnpj = normalize_cnpj_folder(cnpj_match.group(0))
+    before = stem[: cnpj_match.start()].rstrip()
+    after = stem[cnpj_match.end() :].strip()
+    if after.startswith("- "):
+        periodo = normalize_periodo(after[2:])
+    else:
+        periodo = "Incremental"
+
+    if " - " not in before:
+        return None
+
+    codigo, razao = before.split(" - ", 1)
+    return NfseZipMeta(
+        codigo=codigo.strip(),
+        razao=razao.strip(),
+        cnpj=cnpj,
+        periodo=periodo,
+    )
 
 
 def unique_dir(directory: Path, name: str) -> Path:
@@ -121,8 +225,74 @@ def unique_dir(directory: Path, name: str) -> Path:
         index += 1
 
 
+def map_zip_entry_to_dest(entry_name: str, period_dir: Path) -> Path | None:
+    parts = entry_name.replace("\\", "/").split("/")
+    if not parts or parts[-1] == "":
+        return None
+
+    filename = parts[-1]
+    if not filename or filename.endswith("/"):
+        return None
+
+    # root/YYYY-MM/Tipo/arquivo
+    if len(parts) >= 4 and MONTH_FOLDER_PATTERN.match(parts[1]):
+        tipo = parts[2]
+        return period_dir / tipo / filename
+
+    # root/Tipo/arquivo (sem mês)
+    if len(parts) >= 3:
+        tipo = parts[1]
+        return period_dir / tipo / filename
+
+    if len(parts) == 2:
+        return period_dir / filename
+
+    return None
+
+
+def assert_relative(dest: Path, target: Path) -> None:
+    dest = dest.resolve()
+    target = target.resolve()
+    if not target.is_relative_to(dest):
+        raise HTTPException(status_code=400, detail="ZIP com caminho inválido.")
+
+
+def extract_structured(zf: zipfile.ZipFile, dest_root: Path, meta: NfseZipMeta) -> tuple[Path, int]:
+    """Extrai para {codigo} - {razao} - {cnpj}/{periodo}/… como o robô."""
+    client_dir = dest_root / meta.client_folder
+    period_dir = client_dir / meta.periodo
+    period_dir.mkdir(parents=True, exist_ok=True)
+
+    files = 0
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename.replace("\\", "/")
+        if not name or name.endswith("/"):
+            continue
+        if ".." in Path(name).parts:
+            raise HTTPException(status_code=400, detail="ZIP com caminho inválido.")
+
+        dest_file = map_zip_entry_to_dest(name, period_dir)
+        if dest_file is None:
+            # arquivo solto na raiz do ZIP
+            if "/" not in name.rstrip("/"):
+                dest_file = period_dir / Path(name).name
+            else:
+                logger.debug("Ignorando entrada: %s", name)
+                continue
+
+        assert_relative(dest_root, dest_file)
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, dest_file.open("wb") as out:
+            out.write(src.read())
+        files += 1
+
+    return period_dir, files
+
+
 def safe_extract(zf: zipfile.ZipFile, dest: Path) -> int:
-    """Extract zip members into dest; reject path traversal. Returns file count."""
+    """Fallback: extrai membros do ZIP em dest; rejeita path traversal."""
     dest = dest.resolve()
     dest.mkdir(parents=True, exist_ok=True)
     files = 0
@@ -130,7 +300,6 @@ def safe_extract(zf: zipfile.ZipFile, dest: Path) -> int:
         name = info.filename.replace("\\", "/")
         if not name or name.endswith("/"):
             continue
-        # Drop absolute / drive-style prefixes before joining
         parts = [p for p in Path(name).parts if p not in ("/", ".", "..")]
         if not parts or ".." in Path(name).parts:
             raise HTTPException(status_code=400, detail="ZIP com caminho inválido.")
@@ -188,7 +357,8 @@ async def receive_zip(
     verify_auth(authorization, cfg)
     verify_origin(origin, referer, cfg)
 
-    filename = sanitize_filename(file.filename)
+    raw_filename = file.filename or "nfse.zip"
+    filename = sanitize_filename(raw_filename)
     content_type = (file.content_type or "").lower()
     if content_type and content_type not in {
         "application/zip",
@@ -204,13 +374,19 @@ async def receive_zip(
         raise HTTPException(status_code=400, detail="Arquivo vazio.")
 
     cfg.dest_dir.mkdir(parents=True, exist_ok=True)
-    extract_dir = unique_dir(cfg.dest_dir, Path(filename).stem)
+    # Parse no nome cru (pode ter /) e no sanitizado (com _)
+    meta = parse_zip_filename(raw_filename) or parse_zip_filename(filename)
 
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             if zf.testzip() is not None:
                 raise HTTPException(status_code=400, detail="ZIP corrompido.")
-            file_count = safe_extract(zf, extract_dir)
+            if meta is not None:
+                extract_dir, file_count = extract_structured(zf, cfg.dest_dir, meta)
+            else:
+                # Fallback: stem completo já sanitizado (sem truncar no CNPJ)
+                extract_dir = unique_dir(cfg.dest_dir, Path(filename).stem)
+                file_count = safe_extract(zf, extract_dir)
     except HTTPException:
         raise
     except zipfile.BadZipFile:
@@ -225,8 +401,8 @@ async def receive_zip(
     return JSONResponse(
         status_code=201,
         content={
-            "extractedTo": extract_dir.name,
-            "path": str(extract_dir),
+            "extractedTo": extract_dir.name if meta is None else meta.client_folder,
+            "path": str(extract_dir if meta is None else extract_dir.parent),
             "files": file_count,
         },
     )
