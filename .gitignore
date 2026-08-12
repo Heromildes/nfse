@@ -1,0 +1,6 @@
+nfse_zip_receiver_venv/
+.env
+*.log
+__pycache__/
+.pytest_cache/
+*.pyc
